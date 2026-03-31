@@ -18,6 +18,13 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+# OneDrive upload settings
+ONEDRIVE_FOLDER   = "ClaudeUsageDashboards"          # folder in your OneDrive root
+TOKEN_CACHE_FILE  = Path.home() / ".claude" / "onedrive_token_cache.bin"
+MS_CLIENT_ID      = "d3590ed6-52b3-4102-aeff-aad2292ab01c"  # Microsoft Office public client
+MS_AUTHORITY      = "https://login.microsoftonline.com/organizations"
+MS_SCOPES         = ["https://graph.microsoft.com/Files.ReadWrite"]
+
 # ---------------------------------------------------------------------------
 # Model pricing (USD per 1M tokens, as of early 2026)
 # ---------------------------------------------------------------------------
@@ -618,6 +625,114 @@ new Chart(document.getElementById('donutChart'), {{
 
 
 # ---------------------------------------------------------------------------
+# OneDrive upload
+# ---------------------------------------------------------------------------
+
+def _load_msal_app():
+    """Build an MSAL PublicClientApplication with a persistent token cache."""
+    try:
+        import msal
+    except ImportError:
+        return None, None
+
+    cache = msal.SerializableTokenCache()
+    if TOKEN_CACHE_FILE.exists():
+        cache.deserialize(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+
+    app = msal.PublicClientApplication(MS_CLIENT_ID, authority=MS_AUTHORITY, token_cache=cache)
+    return app, cache
+
+
+def _save_cache(cache) -> None:
+    if cache and cache.has_state_changed:
+        TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_CACHE_FILE.write_text(cache.serialize(), encoding="utf-8")
+        TOKEN_CACHE_FILE.chmod(0o600)
+
+
+def get_onedrive_token() -> str | None:
+    """
+    Return a valid OneDrive access token.
+    - Uses cached token silently if available.
+    - Falls back to interactive device-code flow on first run.
+    - Returns None if msal is not installed.
+    """
+    app, cache = _load_msal_app()
+    if app is None:
+        return None
+
+    accounts = app.get_accounts()
+    result = None
+    if accounts:
+        result = app.acquire_token_silent(MS_SCOPES, account=accounts[0])
+
+    if not result or "access_token" not in result:
+        # Interactive device-code flow (only needed once; token is then cached)
+        flow = app.initiate_device_flow(scopes=MS_SCOPES)
+        if "user_code" not in flow:
+            print(f"[warn] OneDrive device flow failed: {flow}", file=sys.stderr)
+            return None
+        print("\n" + "=" * 60)
+        print("  OneDrive authentication required (one-time setup)")
+        print(f"  Visit : {flow['verification_uri']}")
+        print(f"  Code  : {flow['user_code']}")
+        print("=" * 60)
+        print("Enter the code on the website, then press Enter here...")
+        input()
+        result = app.acquire_token_by_device_flow(flow)
+
+    _save_cache(cache)
+
+    if "access_token" not in result:
+        print(f"[warn] OneDrive auth failed: {result.get('error_description', result)}", file=sys.stderr)
+        return None
+
+    return result["access_token"]
+
+
+def upload_to_onedrive(html_content: str, filename: str) -> str | None:
+    """
+    Upload html_content to OneDrive at /{ONEDRIVE_FOLDER}/{filename}.
+    Returns the file's web URL on success, or None on failure.
+    """
+    try:
+        import urllib.request
+        import urllib.error
+    except ImportError:
+        return None
+
+    token = get_onedrive_token()
+    if not token:
+        return None
+
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/me/drive/root:/"
+        f"{ONEDRIVE_FOLDER}/{filename}:/content"
+    )
+    data = html_content.encode("utf-8")
+    req  = urllib.request.Request(
+        upload_url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "text/html",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            item = json.loads(resp.read().decode())
+            return item.get("webUrl")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        print(f"[warn] OneDrive upload failed ({exc.code}): {body}", file=sys.stderr)
+        return None
+    except Exception as exc:
+        print(f"[warn] OneDrive upload error: {exc}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -656,6 +771,16 @@ def main():
 
     print(f"  Dashboard saved: {dated_file}")
     print(f"  Latest link:     {latest_file}")
+
+    # Upload to OneDrive (skipped silently if msal not installed)
+    dated_name  = f"claude_usage_{target_date}.html"
+    web_url = upload_to_onedrive(html, dated_name)
+    if web_url:
+        print(f"  OneDrive URL:    {web_url}")
+        # Also overwrite latest.html on OneDrive
+        upload_to_onedrive(html, "latest.html")
+    else:
+        print("  OneDrive upload skipped (run once interactively to authenticate).")
 
 
 if __name__ == "__main__":
